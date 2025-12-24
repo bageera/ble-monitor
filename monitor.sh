@@ -1,100 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-###############################################################################
-# BLE Monitor — Stateless Signal Publisher
-#
-# Publishes:
-#   presence/ble/raw/<node>/status   → online | offline   (retained)
-#   presence/ble/raw/<node>/seen     → true              (non-retained)
-#   presence/ble/raw/<node>/rssi     → <dBm>             (non-retained)
-#
-# Does NOT:
-#   - Track identities
-#   - Publish home / not_home
-#   - Persist MACs
-#   - Perform aggregation
-###############################################################################
-
-VERSION="0.3.0"
-
-###############################################################################
-# Environment
-###############################################################################
-
-NODE_NAME="${HOSTNAME:-ble-node}"
-
-MQTT_SERVER="${MQTT_ADDRESS:-127.0.0.1}"
+HOSTNAME="${HOSTNAME:-$(hostname)}"
+MQTT_HOST="${MQTT_ADDRESS:-127.0.0.1}"
 MQTT_PORT="${MQTT_PORT:-1883}"
-MQTT_USERNAME="${MQTT_USERNAME:-}"
-MQTT_PASSWORD="${MQTT_PASSWORD:-}"
+MQTT_USER="${MQTT_USERNAME:-}"
+MQTT_PASS="${MQTT_PASSWORD:-}"
 
-PUBLISH_INTERVAL=30        # seconds between "seen" publishes
-SCAN_IFACE="${SCAN_IFACE:-hci0}"
+BASE_TOPIC="presence/ble"
+STATUS_TOPIC="${BASE_TOPIC}/raw/${HOSTNAME}/status"
 
-LAST_SEEN_TS=0
-
-###############################################################################
-# Helpers
-###############################################################################
-
-mqtt_pub() {
-  local topic="$1"
-  local payload="$2"
-  local retain="${3:-false}"
-
-  local retain_flag=""
-  [ "$retain" = "true" ] && retain_flag="-r"
-
-  mosquitto_pub \
-    -h "$MQTT_SERVER" \
-    -p "$MQTT_PORT" \
-    -u "$MQTT_USERNAME" \
-    -P "$MQTT_PASSWORD" \
-    -t "$topic" \
-    -m "$payload" \
-    $retain_flag
-}
+SCAN_IFACE="${BLE_IFACE:-hci0}"
+RSSI_THRESHOLD="${RSSI_THRESHOLD:--85}"
+STATE="unknown"
+LAST_ONLINE=0
+OFFLINE_GRACE=180   # seconds
 
 log() {
   echo "[ble-monitor] $*"
 }
 
-###############################################################################
-# Lifecycle
-###############################################################################
-
-on_exit() {
-  log "Publishing offline"
-  mqtt_pub "presence/ble/raw/${NODE_NAME}/status" "offline" true
+mqtt_pub() {
+  mosquitto_pub \
+    -h "$MQTT_HOST" -p "$MQTT_PORT" \
+    ${MQTT_USER:+-u "$MQTT_USER"} \
+    ${MQTT_PASS:+-P "$MQTT_PASS"} \
+    -t "$1" -m "$2" -r
 }
 
-trap on_exit EXIT INT TERM
+publish_state() {
+  local new="$1"
+  if [[ "$STATE" != "$new" ]]; then
+    STATE="$new"
+    log "Publishing $STATE"
+    mqtt_pub "$STATUS_TOPIC" "$STATE"
+  fi
+}
 
-log "Starting BLE Monitor v${VERSION} on ${NODE_NAME}"
-mqtt_pub "presence/ble/raw/${NODE_NAME}/status" "online" true
+fingerprint_and_publish() {
+  local src="$1"
+  local payload="$2"
+  local rssi="$3"
 
-###############################################################################
-# BLE Scan Loop
-###############################################################################
+  local fp
+  fp=$(echo "${src}:${payload}" | sha1sum | awk '{print $1}')
 
-log "Listening for BLE advertisements on ${SCAN_IFACE}"
+  mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
+    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\"}"
+}
 
-btmon --readline 2>/dev/null | while read -r line; do
-  # Only care about Google BLE payloads (Android presence signal)
-  if [[ "$line" =~ Google ]]; then
-    now=$(date +%s)
+log "Starting BLE Monitor v0.3.1 on $HOSTNAME"
+publish_state "offline"
 
-    if (( now - LAST_SEEN_TS >= PUBLISH_INTERVAL )); then
-      log "BLE seen (Google payload)"
-      mqtt_pub "presence/ble/raw/${NODE_NAME}/seen" "true"
-      LAST_SEEN_TS=$now
-    fi
+btmon | while read -r line; do
+  # Google Android BLE
+  if [[ "$line" =~ Service\ Data:\ Google ]]; then
+    read -r data_line
+    payload=$(echo "$data_line" | awk '{print $2}')
+    rssi=$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')
+    [[ -z "$rssi" ]] && continue
+    (( rssi > RSSI_THRESHOLD )) || continue
+
+    LAST_ONLINE=$(date +%s)
+    fingerprint_and_publish "google_fef3" "$payload" "$rssi"
+    publish_state "online"
   fi
 
-  # Extract RSSI if present
-  if [[ "$line" =~ RSSI:\ ([\-0-9]+)\ dBm ]]; then
-    rssi="${BASH_REMATCH[1]}"
-    mqtt_pub "presence/ble/raw/${NODE_NAME}/rssi" "$rssi"
+  # Apple BLE
+  if [[ "$line" =~ Company:\ Apple ]]; then
+    payload=$(echo "$line" | sed 's/.*Data: //')
+    rssi=$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')
+    [[ -z "$rssi" ]] && continue
+    (( rssi > RSSI_THRESHOLD )) || continue
+
+    LAST_ONLINE=$(date +%s)
+    fingerprint_and_publish "apple_004c" "$payload" "$rssi"
+    publish_state "online"
+  fi
+
+  # Offline decay
+  now=$(date +%s)
+  if (( now - LAST_ONLINE > OFFLINE_GRACE )); then
+    publish_state "offline"
   fi
 done
