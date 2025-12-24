@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  packages: write   # required to push to GHCR
+  packages: write
 
 env:
   REGISTRY: ghcr.io
@@ -37,19 +37,21 @@ jobs:
           cat > .docker/config.json <<EOF
           {
             "auths": {
-              "https://ghcr.io": { "auth": "${AUTH}" }
+              "ghcr.io": { "auth": "${AUTH}" }
             }
           }
           EOF
 
       - name: Build + Push (Kaniko)
         uses: docker://gcr.io/kaniko-project/executor:latest
+        env:
+            DOCKER_CONFIG: /github/workspace/.docker
         with:
-          args: >
-            --context=dir:///github/workspace
-            --dockerfile=Dockerfile
-            --docker-config=/github/workspace/.docker
-            --destination=${{ steps.meta.outputs.image }}:dev-${{ steps.meta.outputs.short_sha }}
-            --destination=${{ steps.meta.outputs.image }}:dev-latest
-            --cache=true
-            --cache-ttl=48h
+            args: >
+              --context=dir:///github/workspace
+              --dockerfile=docker/Dockerfile
+              --destination=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+              --destination=${{ steps.meta.outputs.image }}:latest
+              --cache=true
+              --cache-ttl=168h
+  
