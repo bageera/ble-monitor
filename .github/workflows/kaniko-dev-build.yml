@@ -1,0 +1,55 @@
+name: Kaniko Build (Dev → GHCR)
+
+on:
+  push:
+    branches: ["dev"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write   # required to push to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # owner/repo
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: meta
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Write Docker auth for GHCR
+        shell: bash
+        run: |
+          mkdir -p .docker
+          AUTH="$(printf "%s:%s" "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)"
+          cat > .docker/config.json <<EOF
+          {
+            "auths": {
+              "https://ghcr.io": { "auth": "${AUTH}" }
+            }
+          }
+          EOF
+
+      - name: Build + Push (Kaniko)
+        uses: docker://gcr.io/kaniko-project/executor:latest
+        with:
+          args: >
+            --context=dir:///github/workspace
+            --dockerfile=Dockerfile
+            --docker-config=/github/workspace/.docker
+            --destination=${{ steps.meta.outputs.image }}:dev-${{ steps.meta.outputs.short_sha }}
+            --destination=${{ steps.meta.outputs.image }}:dev-latest
+            --cache=true
+            --cache-ttl=48h
