@@ -1,17 +1,18 @@
-name: Kaniko Build (Dev → GHCR)
+name: Kaniko Build (Release → GHCR)
 
 on:
   push:
-    branches: ["dev"]
+    tags:
+      - "v*.*.*"
   workflow_dispatch: {}
 
 permissions:
   contents: read
-  packages: write   # required to push to GHCR
+  packages: write
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # owner/repo
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -25,8 +26,8 @@ jobs:
         id: meta
         shell: bash
         run: |
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          VERSION="${GITHUB_REF_NAME}"   # e.g. v0.1.0
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Write Docker auth for GHCR
@@ -35,11 +36,7 @@ jobs:
           mkdir -p .docker
           AUTH="$(printf "%s:%s" "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)"
           cat > .docker/config.json <<EOF
-          {
-            "auths": {
-              "https://ghcr.io": { "auth": "${AUTH}" }
-            }
-          }
+          { "auths": { "https://ghcr.io": { "auth": "${AUTH}" } } }
           EOF
 
       - name: Build + Push (Kaniko)
@@ -47,9 +44,9 @@ jobs:
         with:
           args: >
             --context=dir:///github/workspace
-            --dockerfile=Dockerfile
+            --dockerfile=docker/Dockerfile
             --docker-config=/github/workspace/.docker
-            --destination=${{ steps.meta.outputs.image }}:dev-${{ steps.meta.outputs.short_sha }}
-            --destination=${{ steps.meta.outputs.image }}:dev-latest
+            --destination=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            --destination=${{ steps.meta.outputs.image }}:latest
             --cache=true
-            --cache-ttl=48h
+            --cache-ttl=168h
