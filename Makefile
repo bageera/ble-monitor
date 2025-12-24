@@ -149,6 +149,17 @@ build-latest:
 build-all: build build-latest
 
 # ---- Tagging ----------------------------------------------
+.PHONY: tag-release push-release
+
+VERSION ?= v0.1.0
+
+tag-release:
+	git tag $(VERSION)
+	git push origin $(VERSION)
+
+push-release:
+	@echo "Release is CI-driven. Push a tag: make tag-release VERSION=vX.Y.Z"
+
 
 tag:
 	$(DOCKER) tag \

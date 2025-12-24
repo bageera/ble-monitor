@@ -214,6 +214,25 @@ What will **not** be added:
 * UI configuration
 
 ---
+## 🚢 Releases
+
+Development images:
+- `dev-<shortsha>`
+- `dev-latest`
+
+Release images (tagged):
+- `vX.Y.Z`
+- `latest`
+
+To cut a release:
+1. Merge `dev` → `main/master`
+2. Tag a version:
+
+```bash
+make tag-release VERSION=v0.1.0
+
+
+---
 
 ## 📜 License
 
