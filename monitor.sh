@@ -21,11 +21,19 @@ log() {
 }
 
 mqtt_pub() {
-  mosquitto_pub \
-    -h "$MQTT_HOST" -p "$MQTT_PORT" \
-    ${MQTT_USER:+-u "$MQTT_USER"} \
-    ${MQTT_PASS:+-P "$MQTT_PASS"} \
-    -t "$1" -m "$2" -r
+  local topic="$1"
+  local msg="$2"
+
+  # Build args safely (no broken quoting)
+  local -a cmd=(mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$topic" -m "$msg" -r)
+
+  [[ -n "$MQTT_USER" ]] && cmd+=(-u "$MQTT_USER")
+  [[ -n "$MQTT_PASS" ]] && cmd+=(-P "$MQTT_PASS")
+
+  # Optional: add debug while troubleshooting
+  # cmd+=(-d)
+
+  "${cmd[@]}"
 }
 
 publish_state() {
@@ -33,7 +41,7 @@ publish_state() {
   if [[ "$STATE" != "$new" ]]; then
     STATE="$new"
     log "Publishing $STATE"
-    mqtt_pub "$STATUS_TOPIC" "$STATE"
+    mqtt_pub "$STATUS_TOPIC" "$STATE" || log "MQTT publish failed (state=$STATE); continuing"
   fi
 }
 
