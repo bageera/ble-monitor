@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# BLE Monitor – container-safe, non-flapping edition
+# v0.3.2
 
-HOSTNAME="${HOSTNAME:-$(hostname)}"
+set -u
+set -o pipefail
+
+HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
+
 MQTT_HOST="${MQTT_ADDRESS:-127.0.0.1}"
 MQTT_PORT="${MQTT_PORT:-1883}"
 MQTT_USER="${MQTT_USERNAME:-}"
@@ -24,24 +29,29 @@ mqtt_pub() {
   local topic="$1"
   local msg="$2"
 
-  # Build args safely (no broken quoting)
-  local -a cmd=(mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$topic" -m "$msg" -r)
+  local -a cmd=(
+    mosquitto_pub
+    -h "$MQTT_HOST"
+    -p "$MQTT_PORT"
+    -t "$topic"
+    -m "$msg"
+    -r
+  )
 
   [[ -n "$MQTT_USER" ]] && cmd+=(-u "$MQTT_USER")
   [[ -n "$MQTT_PASS" ]] && cmd+=(-P "$MQTT_PASS")
 
-  # Optional: add debug while troubleshooting
-  # cmd+=(-d)
-
-  "${cmd[@]}"
+  "${cmd[@]}" || return 1
 }
 
 publish_state() {
   local new="$1"
+
   if [[ "$STATE" != "$new" ]]; then
     STATE="$new"
     log "Publishing $STATE"
-    mqtt_pub "$STATUS_TOPIC" "$STATE" || log "MQTT publish failed (state=$STATE); continuing"
+    mqtt_pub "$STATUS_TOPIC" "$STATE" \
+      || log "MQTT publish failed (state=$STATE); will retry later"
   fi
 }
 
@@ -51,44 +61,11 @@ fingerprint_and_publish() {
   local rssi="$3"
 
   local fp
-  fp=$(echo "${src}:${payload}" | sha1sum | awk '{print $1}')
+  fp=$(printf "%s:%s" "$src" "$payload" | sha1sum | awk '{print $1}')
 
   mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
-    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\"}"
+    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\"}" \
+    || log "MQTT publish failed (fingerprint=$fp)"
 }
 
-log "Starting BLE Monitor v0.3.1 on $HOSTNAME"
-publish_state "offline"
-
-btmon | while read -r line; do
-  # Google Android BLE
-  if [[ "$line" =~ Service\ Data:\ Google ]]; then
-    read -r data_line
-    payload=$(echo "$data_line" | awk '{print $2}')
-    rssi=$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')
-    [[ -z "$rssi" ]] && continue
-    (( rssi > RSSI_THRESHOLD )) || continue
-
-    LAST_ONLINE=$(date +%s)
-    fingerprint_and_publish "google_fef3" "$payload" "$rssi"
-    publish_state "online"
-  fi
-
-  # Apple BLE
-  if [[ "$line" =~ Company:\ Apple ]]; then
-    payload=$(echo "$line" | sed 's/.*Data: //')
-    rssi=$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')
-    [[ -z "$rssi" ]] && continue
-    (( rssi > RSSI_THRESHOLD )) || continue
-
-    LAST_ONLINE=$(date +%s)
-    fingerprint_and_publish "apple_004c" "$payload" "$rssi"
-    publish_state "online"
-  fi
-
-  # Offline decay
-  now=$(date +%s)
-  if (( now - LAST_ONLINE > OFFLINE_GRACE )); then
-    publish_state "offline"
-  fi
-done
+cleanup() {
