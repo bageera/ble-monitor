@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # BLE Monitor — Passive Signal Collector
-# Version: 0.4.0
+# Version: 0.4.1
 
 set -u
 
 # ------------------------------------------------------------
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
@@ -45,6 +45,7 @@ declare -A FP_RSSI_MIN
 declare -A FP_RSSI_MAX
 declare -A FP_STATE
 declare -A FP_CLASS
+declare -A FP_ID
 
 # ------------------------------------------------------------
 log() { echo "[ble-monitor] $*"; }
@@ -82,7 +83,7 @@ publish_stats() {
   done
 
   mqtt_pub "$STATS_TOPIC" \
-    "{\"events\":${EVENT_COUNT},\"rssi_min\":${min},\"rssi_max\":${max},\"interval\":${STATS_INTERVAL},\"version\":\"${VERSION}\"}"
+    "{\"events_interval\":${EVENT_COUNT},\"rssi_min\":${min},\"rssi_max\":${max},\"interval_seconds\":${STATS_INTERVAL},\"version\":\"${VERSION}\"}"
 
   EVENT_COUNT=0
   LAST_STATS="$now"
@@ -94,8 +95,8 @@ should_publish_fp() {
   local last_rssi="${FP_LAST_RSSI[$fp]:-}"
 
   (( now - last_pub >= FP_PUBLISH_INTERVAL )) && return 0
-  [[ -n "$last_rssi" ]] || return 1
 
+  [[ -n "$last_rssi" ]] || return 1
   local delta=$(( rssi - last_rssi ))
   (( delta < 0 )) && delta=$(( -delta ))
   (( delta >= FP_RSSI_DELTA )) && return 0
@@ -107,8 +108,10 @@ publish_fingerprint() {
   local fp="$1" rssi="$2" class="$3" id="$4" now="$5"
 
   FP_LAST_SEEN["$fp"]="$now"
-  FP_STATE["$fp"]="online"
+  FP_LAST_RSSI["$fp"]="$rssi"
   FP_CLASS["$fp"]="$class"
+  FP_ID["$fp"]="$id"
+  FP_STATE["$fp"]="online"
 
   [[ -z "${FP_RSSI_MIN[$fp]:-}" || "$rssi" -lt "${FP_RSSI_MIN[$fp]}" ]] && FP_RSSI_MIN["$fp"]="$rssi"
   [[ -z "${FP_RSSI_MAX[$fp]:-}" || "$rssi" -gt "${FP_RSSI_MAX[$fp]}" ]] && FP_RSSI_MAX["$fp"]="$rssi"
@@ -116,10 +119,19 @@ publish_fingerprint() {
   should_publish_fp "$fp" "$rssi" "$now" || return
 
   FP_LAST_PUB["$fp"]="$now"
-  FP_LAST_RSSI["$fp"]="$rssi"
 
   mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
-    "{\"state\":\"online\",\"class\":\"${class}\",\"id\":\"${id}\",\"rssi\":${rssi},\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
+    "{\"state\":\"online\",\"class\":\"${class}\",\"id\":\"${id}\",\"rssi\":${rssi},\"last_seen\":${now},\"age\":0,\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
+}
+
+publish_fingerprint_offline() {
+  local fp="$1" now="$2"
+  FP_STATE["$fp"]="offline"
+  local last_seen="${FP_LAST_SEEN[$fp]}"
+  local age=$(( now - last_seen ))
+
+  mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
+    "{\"state\":\"offline\",\"class\":\"${FP_CLASS[$fp]}\",\"id\":\"${FP_ID[$fp]}\",\"last_seen\":${last_seen},\"age\":${age},\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
 }
 
 # ------------------------------------------------------------
@@ -137,20 +149,17 @@ btmon 2>/dev/null | while IFS= read -r line; do
 
     payload="$(echo "$line" | sed 's/.*Data: //')"
 
-    # -------- iBeacon (Apple) --------------------------------
     if [[ "$line" == *"Company: Apple"* && "$payload" =~ 4c000215 ]]; then
       uuid="$(echo "$payload" | sed -E 's/.*4c000215(..{32}).*/\1/' \
         | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
       fp="$(printf 'ibeacon:%s' "$uuid" | sha1sum | awk '{print $1}')"
       publish_fingerprint "$fp" "$rssi" "ibeacon" "$uuid" "$now"
 
-    # -------- Eddystone --------------------------------------
     elif [[ "$payload" =~ feaa ]]; then
       uid="$(echo "$payload" | tr -d ' ' | sed -E 's/.*feaa00(..{32}).*/\1/')"
       fp="$(printf 'eddystone:%s' "$uid" | sha1sum | awk '{print $1}')"
       publish_fingerprint "$fp" "$rssi" "eddystone" "$uid" "$now"
 
-    # -------- Generic BLE ------------------------------------
     else
       fp="$(printf '%s' "$payload" | sha1sum | awk '{print $1}')"
       publish_fingerprint "$fp" "$rssi" "generic_ble" "$fp" "$now"
@@ -161,11 +170,9 @@ btmon 2>/dev/null | while IFS= read -r line; do
     publish_state "online"
   fi
 
-  # -------- Fingerprint decay --------------------------------
   for fp in "${!FP_LAST_SEEN[@]}"; do
     if (( now - FP_LAST_SEEN[$fp] > FP_GRACE )) && [[ "${FP_STATE[$fp]}" == "online" ]]; then
-      FP_STATE["$fp"]="offline"
-      mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}/state" "offline"
+      publish_fingerprint_offline "$fp" "$now"
     fi
   done
 
