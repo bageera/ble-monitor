@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # BLE Monitor — Passive Signal Collector
-# Version: 0.3.8
+# Version: 0.4.0
 
 set -u
 
 # ------------------------------------------------------------
-VERSION="0.3.8"
+VERSION="0.4.0"
 
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
@@ -28,6 +28,9 @@ FP_GRACE=300
 STATS_INTERVAL=60
 HEARTBEAT_INTERVAL=60
 
+FP_RSSI_DELTA=6
+FP_PUBLISH_INTERVAL=30
+
 STATE="unknown"
 LAST_ONLINE=0
 LAST_STATS=0
@@ -36,23 +39,21 @@ LAST_HEARTBEAT=0
 EVENT_COUNT=0
 
 declare -A FP_LAST_SEEN
+declare -A FP_LAST_PUB
+declare -A FP_LAST_RSSI
 declare -A FP_RSSI_MIN
 declare -A FP_RSSI_MAX
 declare -A FP_STATE
+declare -A FP_CLASS
 
 # ------------------------------------------------------------
-log() {
-  echo "[ble-monitor] $*"
-}
+log() { echo "[ble-monitor] $*"; }
 
 mqtt_pub() {
-  local topic="$1"
-  local payload="$2"
-
+  local topic="$1" payload="$2"
   local -a cmd=(mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$topic" -m "$payload" -r)
   [[ -n "$MQTT_USER" ]] && cmd+=(-u "$MQTT_USER")
   [[ -n "$MQTT_PASS" ]] && cmd+=(-P "$MQTT_PASS")
-
   "${cmd[@]}" || return 1
 }
 
@@ -60,7 +61,6 @@ publish_state() {
   local new="$1"
   [[ "$STATE" == "$new" ]] && return
   STATE="$new"
-  log "Status → $STATE"
   mqtt_pub "$STATUS_TOPIC" "$STATE"
 }
 
@@ -88,17 +88,38 @@ publish_stats() {
   LAST_STATS="$now"
 }
 
+should_publish_fp() {
+  local fp="$1" rssi="$2" now="$3"
+  local last_pub="${FP_LAST_PUB[$fp]:-0}"
+  local last_rssi="${FP_LAST_RSSI[$fp]:-}"
+
+  (( now - last_pub >= FP_PUBLISH_INTERVAL )) && return 0
+  [[ -n "$last_rssi" ]] || return 1
+
+  local delta=$(( rssi - last_rssi ))
+  (( delta < 0 )) && delta=$(( -delta ))
+  (( delta >= FP_RSSI_DELTA )) && return 0
+
+  return 1
+}
+
 publish_fingerprint() {
-  local fp="$1" rssi="$2" source="$3" now="$4"
+  local fp="$1" rssi="$2" class="$3" id="$4" now="$5"
 
   FP_LAST_SEEN["$fp"]="$now"
   FP_STATE["$fp"]="online"
+  FP_CLASS["$fp"]="$class"
 
   [[ -z "${FP_RSSI_MIN[$fp]:-}" || "$rssi" -lt "${FP_RSSI_MIN[$fp]}" ]] && FP_RSSI_MIN["$fp"]="$rssi"
   [[ -z "${FP_RSSI_MAX[$fp]:-}" || "$rssi" -gt "${FP_RSSI_MAX[$fp]}" ]] && FP_RSSI_MAX["$fp"]="$rssi"
 
+  should_publish_fp "$fp" "$rssi" "$now" || return
+
+  FP_LAST_PUB["$fp"]="$now"
+  FP_LAST_RSSI["$fp"]="$rssi"
+
   mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
-    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${source}\",\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
+    "{\"state\":\"online\",\"class\":\"${class}\",\"id\":\"${id}\",\"rssi\":${rssi},\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
 }
 
 # ------------------------------------------------------------
@@ -109,19 +130,34 @@ publish_state "offline"
 btmon 2>/dev/null | while IFS= read -r line; do
   now="$(date +%s)"
 
-  # -------- Generic BLE advertisement ------------------------
   if [[ "$line" == *"RSSI:"* ]]; then
     rssi="$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')"
     [[ -z "$rssi" ]] && continue
     (( rssi > RSSI_THRESHOLD )) || continue
 
     payload="$(echo "$line" | sed 's/.*Data: //')"
-    fp="$(printf '%s' "$payload" | sha1sum | awk '{print $1}')"
+
+    # -------- iBeacon (Apple) --------------------------------
+    if [[ "$line" == *"Company: Apple"* && "$payload" =~ 4c000215 ]]; then
+      uuid="$(echo "$payload" | sed -E 's/.*4c000215(..{32}).*/\1/' \
+        | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
+      fp="$(printf 'ibeacon:%s' "$uuid" | sha1sum | awk '{print $1}')"
+      publish_fingerprint "$fp" "$rssi" "ibeacon" "$uuid" "$now"
+
+    # -------- Eddystone --------------------------------------
+    elif [[ "$payload" =~ feaa ]]; then
+      uid="$(echo "$payload" | tr -d ' ' | sed -E 's/.*feaa00(..{32}).*/\1/')"
+      fp="$(printf 'eddystone:%s' "$uid" | sha1sum | awk '{print $1}')"
+      publish_fingerprint "$fp" "$rssi" "eddystone" "$uid" "$now"
+
+    # -------- Generic BLE ------------------------------------
+    else
+      fp="$(printf '%s' "$payload" | sha1sum | awk '{print $1}')"
+      publish_fingerprint "$fp" "$rssi" "generic_ble" "$fp" "$now"
+    fi
 
     EVENT_COUNT=$((EVENT_COUNT + 1))
     LAST_ONLINE="$now"
-
-    publish_fingerprint "$fp" "$rssi" "generic_ble" "$now"
     publish_state "online"
   fi
 
@@ -133,10 +169,8 @@ btmon 2>/dev/null | while IFS= read -r line; do
     fi
   done
 
-  # -------- Node offline decay -------------------------------
   (( now - LAST_ONLINE > OFFLINE_GRACE )) && publish_state "offline"
 
-  # -------- Periodic signals --------------------------------
   publish_stats "$now"
   publish_heartbeat "$now"
 done
