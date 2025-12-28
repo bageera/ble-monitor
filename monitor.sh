@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-#version v0.3.3
+# ------------------------------------------------------------
+# BLE Monitor — Passive BLE → MQTT Publisher
+# Version: v0.3.3
+# ------------------------------------------------------------
+
+VERSION="0.3.3"
 
 # ---- Config -------------------------------------------------
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
@@ -11,9 +16,18 @@ MQTT_PASS="${MQTT_PASSWORD:-}"
 
 BASE_TOPIC="${MQTT_TOPIC_PREFIX:-presence/ble/raw}"
 STATUS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/status"
+HEARTBEAT_TOPIC="${BASE_TOPIC}/${HOSTNAME}/heartbeat"
 
 RSSI_THRESHOLD="${RSSI_THRESHOLD:--85}"
 OFFLINE_GRACE=180
+
+# Rate limiting (A)
+FINGERPRINT_MIN_INTERVAL=5
+LAST_FP_PUBLISH=0
+
+# Heartbeat (B)
+HEARTBEAT_INTERVAL=60
+LAST_HEARTBEAT=0
 
 STATE="unknown"
 LAST_ONLINE=0
@@ -57,24 +71,37 @@ fingerprint_publish() {
   local payload="$2"
   local rssi="$3"
 
+  local now
+  now="$(date +%s)"
+
+  # (A) Rate limit fingerprint publishing
+  (( now - LAST_FP_PUBLISH < FINGERPRINT_MIN_INTERVAL )) && return 0
+  LAST_FP_PUBLISH="$now"
+
   local fp
   fp="$(printf '%s:%s' "$src" "$payload" | sha1sum | awk '{print $1}')"
 
   mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
-    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\"}" \
+    "{\"state\":\"online\",\"rssi\":${rssi},\"threshold\":${RSSI_THRESHOLD},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}" \
     || log "MQTT publish failed (fingerprint)"
 }
 
-log "Starting BLE Monitor v0.3.2 on ${HOSTNAME}"
+log "Starting BLE Monitor v${VERSION} on ${HOSTNAME}"
 publish_state "offline"
 
 # ---- Main Loop ----------------------------------------------
 btmon 2>/dev/null | while IFS= read -r line; do
   now="$(date +%s)"
 
+  # (B) Heartbeat — proves liveness even if BLE is silent
+  if (( now - LAST_HEARTBEAT >= HEARTBEAT_INTERVAL )); then
+    mqtt_pub "$HEARTBEAT_TOPIC" "alive"
+    LAST_HEARTBEAT="$now"
+  fi
+
   # -------- Android / Google BLE -----------------------------
   if [[ "$line" == *"Service Data: Google"* ]]; then
-    read -r nextline || continue
+    IFS= read -r nextline || continue
 
     payload="$(echo "$nextline" | awk '{print $2}')"
     rssi="$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')"
