@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # BLE Monitor — Passive Signal Collector
-# Version: 0.4.1
+# Version: 0.4.2
 
 set -u
 
 # ------------------------------------------------------------
-VERSION="0.4.1"
+VERSION="0.4.2"
 
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
@@ -19,6 +19,7 @@ BASE_TOPIC="${MQTT_TOPIC_PREFIX:-presence/ble/raw}"
 STATUS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/status"
 HEARTBEAT_TOPIC="${BASE_TOPIC}/${HOSTNAME}/heartbeat"
 STATS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/stats"
+INVENTORY_TOPIC="${BASE_TOPIC}/${HOSTNAME}/inventory"
 
 RSSI_THRESHOLD="${RSSI_THRESHOLD:--85}"
 
@@ -27,14 +28,24 @@ FP_GRACE=300
 
 STATS_INTERVAL=60
 HEARTBEAT_INTERVAL=60
+INVENTORY_INTERVAL=60
 
 FP_RSSI_DELTA=6
-FP_PUBLISH_INTERVAL=30
+
+# Class-based publish intervals (seconds)
+declare -A CLASS_PUB_INTERVAL=(
+  [generic_ble]=10
+  [apple]=3
+  [google]=3
+  [ibeacon]=5
+  [eddystone]=5
+)
 
 STATE="unknown"
 LAST_ONLINE=0
 LAST_STATS=0
 LAST_HEARTBEAT=0
+LAST_INVENTORY=0
 
 EVENT_COUNT=0
 
@@ -46,6 +57,12 @@ declare -A FP_RSSI_MAX
 declare -A FP_STATE
 declare -A FP_CLASS
 declare -A FP_ID
+
+# Per-class stats
+declare -A CLASS_EVENTS
+declare -A CLASS_RSSI_MIN
+declare -A CLASS_RSSI_MAX
+declare -A CLASS_FP_SET
 
 # ------------------------------------------------------------
 log() { echo "[ble-monitor] $*"; }
@@ -76,27 +93,63 @@ publish_stats() {
   local now="$1"
   (( now - LAST_STATS < STATS_INTERVAL )) && return
 
-  local min=0 max=0
-  for fp in "${!FP_RSSI_MIN[@]}"; do
-    (( min == 0 || FP_RSSI_MIN[$fp] < min )) && min="${FP_RSSI_MIN[$fp]}"
-    (( FP_RSSI_MAX[$fp] > max )) && max="${FP_RSSI_MAX[$fp]}"
+  local classes_json=""
+  for class in "${!CLASS_EVENTS[@]}"; do
+    local min="${CLASS_RSSI_MIN[$class]:-0}"
+    local max="${CLASS_RSSI_MAX[$class]:-0}"
+    local uniq="${CLASS_FP_SET[$class]:-0}"
+
+    classes_json+=",\"${class}\":{\"events\":${CLASS_EVENTS[$class]},\"unique\":${uniq},\"rssi_min\":${min},\"rssi_max\":${max}}"
   done
 
+  classes_json="{${classes_json#,}}"
+
   mqtt_pub "$STATS_TOPIC" \
-    "{\"events_interval\":${EVENT_COUNT},\"rssi_min\":${min},\"rssi_max\":${max},\"interval_seconds\":${STATS_INTERVAL},\"version\":\"${VERSION}\"}"
+    "{\"version\":\"${VERSION}\",\"interval\":${STATS_INTERVAL},\"total_events\":${EVENT_COUNT},\"classes\":${classes_json}}"
 
   EVENT_COUNT=0
+  CLASS_EVENTS=()
+  CLASS_RSSI_MIN=()
+  CLASS_RSSI_MAX=()
+  CLASS_FP_SET=()
+
   LAST_STATS="$now"
 }
 
+publish_inventory() {
+  local now="$1"
+  (( now - LAST_INVENTORY < INVENTORY_INTERVAL )) && return
+
+  declare -A counts
+  for fp in "${!FP_CLASS[@]}"; do
+    ((counts["${FP_CLASS[$fp]}"]++))
+  done
+
+  local payload="{\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\",\"timestamp\":${now},\"fingerprints\":{"
+  local first=1
+  local total=0
+  for k in "${!counts[@]}"; do
+    [[ $first -eq 0 ]] && payload+=","
+    payload+="\"${k}\":${counts[$k]}"
+    total=$((total + counts[$k]))
+    first=0
+  done
+  payload+="},\"total\":${total}}"
+
+  mqtt_pub "$INVENTORY_TOPIC" "$payload"
+  LAST_INVENTORY="$now"
+}
+
 should_publish_fp() {
-  local fp="$1" rssi="$2" now="$3"
+  local fp="$1" class="$2" rssi="$3" now="$4"
   local last_pub="${FP_LAST_PUB[$fp]:-0}"
+  local interval="${CLASS_PUB_INTERVAL[$class]:-10}"
+
+  (( now - last_pub >= interval )) && return 0
+
   local last_rssi="${FP_LAST_RSSI[$fp]:-}"
+  [[ -z "$last_rssi" ]] && return 1
 
-  (( now - last_pub >= FP_PUBLISH_INTERVAL )) && return 0
-
-  [[ -n "$last_rssi" ]] || return 1
   local delta=$(( rssi - last_rssi ))
   (( delta < 0 )) && delta=$(( -delta ))
   (( delta >= FP_RSSI_DELTA )) && return 0
@@ -116,7 +169,13 @@ publish_fingerprint() {
   [[ -z "${FP_RSSI_MIN[$fp]:-}" || "$rssi" -lt "${FP_RSSI_MIN[$fp]}" ]] && FP_RSSI_MIN["$fp"]="$rssi"
   [[ -z "${FP_RSSI_MAX[$fp]:-}" || "$rssi" -gt "${FP_RSSI_MAX[$fp]}" ]] && FP_RSSI_MAX["$fp"]="$rssi"
 
-  should_publish_fp "$fp" "$rssi" "$now" || return
+  ((CLASS_EVENTS["$class"]++))
+  [[ -z "${CLASS_RSSI_MIN[$class]:-}" || "$rssi" -lt "${CLASS_RSSI_MIN[$class]}" ]] && CLASS_RSSI_MIN["$class"]="$rssi"
+  [[ -z "${CLASS_RSSI_MAX[$class]:-}" || "$rssi" -gt "${CLASS_RSSI_MAX[$class]}" ]] && CLASS_RSSI_MAX["$class"]="$rssi"
+  CLASS_FP_SET["$class"]=$((CLASS_FP_SET["$class"] + 0))
+  CLASS_FP_SET["$class"]=$((CLASS_FP_SET["$class"] + 1))
+
+  should_publish_fp "$fp" "$class" "$rssi" "$now" || return
 
   FP_LAST_PUB["$fp"]="$now"
 
@@ -179,5 +238,6 @@ btmon 2>/dev/null | while IFS= read -r line; do
   (( now - LAST_ONLINE > OFFLINE_GRACE )) && publish_state "offline"
 
   publish_stats "$now"
+  publish_inventory "$now"
   publish_heartbeat "$now"
 done
