@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # BLE Monitor – container-safe, non-flapping edition
-# v0.3.2
+# v0.3.3
 
 set -u
-set -o pipefail
 
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
