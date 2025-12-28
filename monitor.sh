@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # BLE Monitor — Passive Signal Collector
-# Version: 0.3.7
+# Version: 0.3.8
 
 set -u
 
 # ------------------------------------------------------------
-VERSION="0.3.7"
+VERSION="0.3.8"
 
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
@@ -15,18 +15,23 @@ MQTT_USER="${MQTT_USERNAME:-}"
 MQTT_PASS="${MQTT_PASSWORD:-}"
 
 BASE_TOPIC="${MQTT_TOPIC_PREFIX:-presence/ble/raw}"
+
 STATUS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/status"
 HEARTBEAT_TOPIC="${BASE_TOPIC}/${HOSTNAME}/heartbeat"
 STATS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/stats"
 
 RSSI_THRESHOLD="${RSSI_THRESHOLD:--85}"
+
 OFFLINE_GRACE=180
 FP_GRACE=300
+
 STATS_INTERVAL=60
+HEARTBEAT_INTERVAL=60
 
 STATE="unknown"
 LAST_ONLINE=0
 LAST_STATS=0
+LAST_HEARTBEAT=0
 
 EVENT_COUNT=0
 
@@ -55,19 +60,22 @@ publish_state() {
   local new="$1"
   [[ "$STATE" == "$new" ]] && return
   STATE="$new"
-  log "Publishing status: $STATE"
+  log "Status → $STATE"
   mqtt_pub "$STATUS_TOPIC" "$STATE"
 }
 
 publish_heartbeat() {
+  local now="$1"
+  (( now - LAST_HEARTBEAT < HEARTBEAT_INTERVAL )) && return
   mqtt_pub "$HEARTBEAT_TOPIC" "alive"
+  LAST_HEARTBEAT="$now"
 }
 
 publish_stats() {
   local now="$1"
+  (( now - LAST_STATS < STATS_INTERVAL )) && return
 
-  local min=0
-  local max=0
+  local min=0 max=0
   for fp in "${!FP_RSSI_MIN[@]}"; do
     (( min == 0 || FP_RSSI_MIN[$fp] < min )) && min="${FP_RSSI_MIN[$fp]}"
     (( FP_RSSI_MAX[$fp] > max )) && max="${FP_RSSI_MAX[$fp]}"
@@ -81,10 +89,7 @@ publish_stats() {
 }
 
 publish_fingerprint() {
-  local fp="$1"
-  local rssi="$2"
-  local source="$3"
-  local now="$4"
+  local fp="$1" rssi="$2" source="$3" now="$4"
 
   FP_LAST_SEEN["$fp"]="$now"
   FP_STATE["$fp"]="online"
@@ -131,8 +136,7 @@ btmon 2>/dev/null | while IFS= read -r line; do
   # -------- Node offline decay -------------------------------
   (( now - LAST_ONLINE > OFFLINE_GRACE )) && publish_state "offline"
 
-  # -------- Heartbeat & stats --------------------------------
-  (( now - LAST_STATS >= STATS_INTERVAL )) && publish_stats "$now"
-  publish_heartbeat
-
+  # -------- Periodic signals --------------------------------
+  publish_stats "$now"
+  publish_heartbeat "$now"
 done
