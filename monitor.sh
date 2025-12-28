@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------
-# BLE Monitor — Passive Presence Sensor
-# Version: v0.3.6
-# ------------------------------------------------------------
+# BLE Monitor — Passive Signal Collector
+# Version: 0.3.7
 
 set -u
 
-# -------------------- Version -------------------------------
-VERSION="0.3.6"
+# ------------------------------------------------------------
+VERSION="0.3.7"
 
-# -------------------- Config --------------------------------
 HOSTNAME="${MQTT_PUBLISHER_IDENTITY:-${HOSTNAME:-$(hostname)}}"
 
 MQTT_HOST="${MQTT_ADDRESS:-127.0.0.1}"
@@ -23,17 +20,22 @@ HEARTBEAT_TOPIC="${BASE_TOPIC}/${HOSTNAME}/heartbeat"
 STATS_TOPIC="${BASE_TOPIC}/${HOSTNAME}/stats"
 
 RSSI_THRESHOLD="${RSSI_THRESHOLD:--85}"
-OFFLINE_GRACE="${OFFLINE_GRACE:-180}"
-STATS_INTERVAL="${STATS_INTERVAL:-60}"
+OFFLINE_GRACE=180
+FP_GRACE=300
+STATS_INTERVAL=60
 
 STATE="unknown"
 LAST_ONLINE=0
-BLE_EVENT_COUNT=0
-RSSI_MIN=0
-RSSI_MAX=0
-LAST_STATS_TS=0
-# ------------------------------------------------------------
+LAST_STATS=0
 
+EVENT_COUNT=0
+
+declare -A FP_LAST_SEEN
+declare -A FP_RSSI_MIN
+declare -A FP_RSSI_MAX
+declare -A FP_STATE
+
+# ------------------------------------------------------------
 log() {
   echo "[ble-monitor] $*"
 }
@@ -42,28 +44,19 @@ mqtt_pub() {
   local topic="$1"
   local payload="$2"
 
-  local -a cmd=(
-    mosquitto_pub
-    -h "$MQTT_HOST"
-    -p "$MQTT_PORT"
-    -t "$topic"
-    -m "$payload"
-    -r
-  )
-
+  local -a cmd=(mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$topic" -m "$payload" -r)
   [[ -n "$MQTT_USER" ]] && cmd+=(-u "$MQTT_USER")
   [[ -n "$MQTT_PASS" ]] && cmd+=(-P "$MQTT_PASS")
 
-  "${cmd[@]}" >/dev/null 2>&1 || return 1
+  "${cmd[@]}" || return 1
 }
 
 publish_state() {
   local new="$1"
-  if [[ "$STATE" != "$new" ]]; then
-    STATE="$new"
-    log "Publishing status: $STATE"
-    mqtt_pub "$STATUS_TOPIC" "$STATE" || log "MQTT publish failed (status)"
-  fi
+  [[ "$STATE" == "$new" ]] && return
+  STATE="$new"
+  log "Publishing status: $STATE"
+  mqtt_pub "$STATUS_TOPIC" "$STATE"
 }
 
 publish_heartbeat() {
@@ -73,75 +66,73 @@ publish_heartbeat() {
 publish_stats() {
   local now="$1"
 
-  mqtt_pub "$STATS_TOPIC" \
-    "{\"events\":${BLE_EVENT_COUNT},\"rssi_min\":${RSSI_MIN},\"rssi_max\":${RSSI_MAX},\"interval\":${STATS_INTERVAL},\"version\":\"${VERSION}\"}"
+  local min=0
+  local max=0
+  for fp in "${!FP_RSSI_MIN[@]}"; do
+    (( min == 0 || FP_RSSI_MIN[$fp] < min )) && min="${FP_RSSI_MIN[$fp]}"
+    (( FP_RSSI_MAX[$fp] > max )) && max="${FP_RSSI_MAX[$fp]}"
+  done
 
-  BLE_EVENT_COUNT=0
-  RSSI_MIN=0
-  RSSI_MAX=0
-  LAST_STATS_TS="$now"
+  mqtt_pub "$STATS_TOPIC" \
+    "{\"events\":${EVENT_COUNT},\"rssi_min\":${min},\"rssi_max\":${max},\"interval\":${STATS_INTERVAL},\"version\":\"${VERSION}\"}"
+
+  EVENT_COUNT=0
+  LAST_STATS="$now"
 }
 
-fingerprint_publish() {
-  local src="$1"
-  local payload="$2"
-  local rssi="$3"
+publish_fingerprint() {
+  local fp="$1"
+  local rssi="$2"
+  local source="$3"
+  local now="$4"
 
-  local fp
-  fp="$(printf '%s:%s' "$src" "$payload" | sha1sum | awk '{print $1}')"
+  FP_LAST_SEEN["$fp"]="$now"
+  FP_STATE["$fp"]="online"
+
+  [[ -z "${FP_RSSI_MIN[$fp]:-}" || "$rssi" -lt "${FP_RSSI_MIN[$fp]}" ]] && FP_RSSI_MIN["$fp"]="$rssi"
+  [[ -z "${FP_RSSI_MAX[$fp]:-}" || "$rssi" -gt "${FP_RSSI_MAX[$fp]}" ]] && FP_RSSI_MAX["$fp"]="$rssi"
 
   mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}" \
-    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${src}\",\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
+    "{\"state\":\"online\",\"rssi\":${rssi},\"source\":\"${source}\",\"host\":\"${HOSTNAME}\",\"version\":\"${VERSION}\"}"
 }
 
-# -------------------- Startup --------------------------------
+# ------------------------------------------------------------
 log "Starting BLE Monitor v${VERSION} on ${HOSTNAME}"
 publish_state "offline"
-publish_heartbeat
-# -------------------------------------------------------------
 
-# -------------------- Main Loop -------------------------------
+# ------------------------------------------------------------
 btmon 2>/dev/null | while IFS= read -r line; do
   now="$(date +%s)"
 
-  # ---------------- Generic BLE Activity ---------------------
+  # -------- Generic BLE advertisement ------------------------
   if [[ "$line" == *"RSSI:"* ]]; then
     rssi="$(echo "$line" | grep -oE 'RSSI: -?[0-9]+' | awk '{print $2}')"
     [[ -z "$rssi" ]] && continue
     (( rssi > RSSI_THRESHOLD )) || continue
 
+    payload="$(echo "$line" | sed 's/.*Data: //')"
+    fp="$(printf '%s' "$payload" | sha1sum | awk '{print $1}')"
+
+    EVENT_COUNT=$((EVENT_COUNT + 1))
     LAST_ONLINE="$now"
-    ((BLE_EVENT_COUNT++))
 
-    [[ "$RSSI_MIN" -eq 0 || "$rssi" -lt "$RSSI_MIN" ]] && RSSI_MIN="$rssi"
-    [[ "$RSSI_MAX" -eq 0 || "$rssi" -gt "$RSSI_MAX" ]] && RSSI_MAX="$rssi"
-
+    publish_fingerprint "$fp" "$rssi" "generic_ble" "$now"
     publish_state "online"
+  fi
 
-    # ---- Classification Layer -------------------------------
-    if [[ "$line" == *"Service Data: Google"* ]]; then
-      read -r nextline || true
-      payload="$(echo "$nextline" | awk '{print $2}')"
-      fingerprint_publish "google_fef3" "$payload" "$rssi"
-
-    elif [[ "$line" == *"Company: Apple"* ]]; then
-      payload="$(echo "$line" | sed 's/.*Data: //')"
-      fingerprint_publish "apple_004c" "$payload" "$rssi"
-
-    else
-      fingerprint_publish "generic_ble" "advertisement" "$rssi"
+  # -------- Fingerprint decay --------------------------------
+  for fp in "${!FP_LAST_SEEN[@]}"; do
+    if (( now - FP_LAST_SEEN[$fp] > FP_GRACE )) && [[ "${FP_STATE[$fp]}" == "online" ]]; then
+      FP_STATE["$fp"]="offline"
+      mqtt_pub "${BASE_TOPIC}/fingerprint/${fp}/state" "offline"
     fi
-  fi
+  done
 
-  # ---------------- Offline Decay -----------------------------
-  if (( now - LAST_ONLINE > OFFLINE_GRACE )); then
-    publish_state "offline"
-  fi
+  # -------- Node offline decay -------------------------------
+  (( now - LAST_ONLINE > OFFLINE_GRACE )) && publish_state "offline"
 
-  # ---------------- Periodic Stats ---------------------------
-  if (( now - LAST_STATS_TS >= STATS_INTERVAL )); then
-    publish_stats "$now"
-    publish_heartbeat
-  fi
+  # -------- Heartbeat & stats --------------------------------
+  (( now - LAST_STATS >= STATS_INTERVAL )) && publish_stats "$now"
+  publish_heartbeat
 
 done
